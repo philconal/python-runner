@@ -1,8 +1,9 @@
 import re
-import json
 import argparse
 import requests
-from urllib.parse import urlparse, parse_qs
+import sys
+import json
+from urllib.parse import urlparse
 
 
 START_URL = "https://blueprint.cyberlogitec.com.vn/sso/login"
@@ -10,6 +11,15 @@ UI_PAGE = "https://blueprint.cyberlogitec.com.vn/UI_TAT_028"
 CHECKIN_API = "https://blueprint.cyberlogitec.com.vn/api/checkInOut/insert"
 
 
+# ================= ERROR CLASS =================
+class CheckinError(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+# ================= UTIL =================
 def to_absolute_url(base_url: str, location: str):
     if not location:
         return None
@@ -24,210 +34,161 @@ def to_absolute_url(base_url: str, location: str):
 def extract_login_action(html: str):
     match = re.search(r'action="([^"]+login-actions/authenticate[^"]+)"', html)
     if not match:
-        raise Exception("Cannot find login form action URL in HTML")
+        raise CheckinError(1007, "Cannot find login form action URL")
     return match.group(1).replace("&amp;", "&")
 
 
 def create_session():
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     })
     return session
 
 
-def parse_accounts(args):
-    accounts = []
+# ================= PARSE ACCOUNT =================
+def parse_account(raw: str):
+    parts = raw.split(":")
 
-    if args.accounts:
-        for raw_account in args.accounts:
-            if ":" not in raw_account:
-                raise ValueError(f"Invalid account format: {raw_account}. Use username:password")
-            username, password = raw_account.split(":", 1)
-            username = username.strip()
-            if not username:
-                raise ValueError(f"Username is empty in account: {raw_account}")
-            accounts.append((username, password))
+    if len(parts) != 3:
+        raise ValueError("Format must be username:password:email")
 
-    if args.accounts_json:
-        with open(args.accounts_json, "r", encoding="utf-8") as f:
-            json_data = json.load(f)
+    username, password, email = parts
 
-        if not isinstance(json_data, list):
-            raise ValueError("JSON file must be a list of accounts")
+    username = username.strip()
+    email = email.strip()
 
-        for idx, item in enumerate(json_data):
-            if not isinstance(item, dict):
-                raise ValueError(f"Account at index {idx} must be an object")
+    if not username:
+        raise ValueError("Username is empty")
 
-            username = str(item.get("username", "")).strip()
-            password = str(item.get("password", ""))
+    if not email:
+        raise ValueError("Email is empty")
 
-            if not username:
-                raise ValueError(f"Missing or empty username at index {idx}")
-
-            accounts.append((username, password))
-
-    if accounts:
-        return accounts
-
-    return [(USERNAME, PASSWORD)]
+    return username, password, email
 
 
-def run_checkin(username: str, password: str):
+# ================= CORE LOGIC =================
+def run_checkin(username: str, password: str, email: str):
     session = create_session()
 
-    print(f"\n================= ACCOUNT: {username} =================")
-    print("====================================================")
-    print("[1] Start flow from Blueprint /sso/login")
-    print("====================================================")
+    try:
+        r1 = session.get(START_URL, allow_redirects=False, timeout=30)
 
-    r1 = session.get(START_URL, allow_redirects=False, timeout=30)
+        redirect1 = r1.headers.get("Location")
+        state_cookie = session.cookies.get("OAuth_Token_Request_State")
 
-    print("Blueprint /sso/login status:", r1.status_code)
-    redirect1 = r1.headers.get("Location")
-    print("Redirect ->", redirect1)
+        if not state_cookie:
+            raise CheckinError(1001, "Missing OAuth cookie")
 
-    state_cookie = session.cookies.get("OAuth_Token_Request_State")
-    print("OAuth_Token_Request_State cookie:", state_cookie)
+        if not redirect1:
+            raise CheckinError(1002, "No redirect to Keycloak")
 
-    if not state_cookie:
-        raise Exception("Missing OAuth_Token_Request_State cookie")
+        auth_url = to_absolute_url(START_URL, redirect1)
+        r2 = session.get(auth_url, allow_redirects=True, timeout=30)
 
-    if not redirect1:
-        raise Exception("Blueprint did not redirect to Keycloak authorize URL")
+        login_action_url = extract_login_action(r2.text)
 
-    auth_url = to_absolute_url(START_URL, redirect1)
+        payload = {
+            "username": username,
+            "password": password,
+            "rememberMe": "on",
+            "credentialId": ""
+        }
 
-    print("====================================================")
-    print("[2] Redirect to Keycloak authorize URL")
-    print("====================================================")
-    print("Auth URL:", auth_url)
+        r3 = session.post(login_action_url, data=payload, allow_redirects=False, timeout=30)
 
-    r2 = session.get(auth_url, allow_redirects=True, timeout=30)
+        redirect2 = r3.headers.get("Location")
 
-    print("Keycloak login page status:", r2.status_code)
-    print("Final URL:", r2.url)
+        if r3.status_code not in (302, 303):
+            raise CheckinError(1003, "Login failed")
 
-    html = r2.text
+        final_url = to_absolute_url(login_action_url, redirect2)
 
-    print("====================================================")
-    print("[3] Extract login form action")
-    print("====================================================")
+        if "code=" not in final_url:
+            raise CheckinError(1004, "Missing authorization code")
 
-    login_action_url = extract_login_action(html)
-    print("Login Action URL:", login_action_url)
+        session.get(final_url, allow_redirects=True, timeout=30)
 
-    print("====================================================")
-    print("[4] Submit username/password")
-    print("====================================================")
+        jsession = session.cookies.get("JSESSIONID")
+        if not jsession:
+            raise CheckinError(1005, "JSESSIONID not found")
 
-    payload = {
-        "username": username,
-        "password": password,
-        "rememberMe": "on",
-        "credentialId": ""
-    }
+        session.get(UI_PAGE, allow_redirects=True, timeout=30)
 
-    r3 = session.post(login_action_url, data=payload, allow_redirects=False, timeout=30)
+        api_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://blueprint.cyberlogitec.com.vn",
+            "Referer": UI_PAGE
+        }
 
-    print("Login POST status:", r3.status_code)
-    redirect2 = r3.headers.get("Location")
-    print("Redirect after login ->", redirect2)
+        api_resp = session.post(CHECKIN_API, headers=api_headers, timeout=30)
 
-    if r3.status_code not in (302, 303):
-        print("Login failed snippet:")
-        print(r3.text[:1200])
-        raise Exception("Login failed")
+        if api_resp.status_code != 200:
+            raise CheckinError(1006, api_resp.text)
 
-    final_blueprint_url = to_absolute_url(login_action_url, redirect2)
+        return {
+            "success": True,
+            "code": 0,
+            "message": "Success",
+            "email": email,
+            "username": username
+        }
 
-    print("====================================================")
-    print("[5] Blueprint callback URL (contains code)")
-    print("====================================================")
-    print(final_blueprint_url)
+    except CheckinError as e:
+        return {
+            "success": False,
+            "code": e.code,
+            "message": e.message,
+            "email": email,
+            "username": username
+        }
 
-    if "code=" not in final_blueprint_url:
-        raise Exception("Redirect URL does not contain code")
-
-    print("====================================================")
-    print("[6] Call blueprint callback URL to create JSESSIONID")
-    print("====================================================")
-
-    r4 = session.get(final_blueprint_url, allow_redirects=True, timeout=30)
-
-    print("Blueprint callback status:", r4.status_code)
-    print("Blueprint final URL:", r4.url)
-
-    jsession = session.cookies.get("JSESSIONID")
-    print("JSESSIONID:", jsession)
-
-    if not jsession:
-        print("Cookies currently:")
-        for c in session.cookies:
-            print("   ", c.name, "=", c.value)
-        raise Exception("JSESSIONID not created. Cannot call checkin API.")
-
-    print("====================================================")
-    print("[7] Open UI page (optional)")
-    print("====================================================")
-
-    session.get(UI_PAGE, allow_redirects=True, timeout=30)
-
-    print("====================================================")
-    print("[8] Call CheckIn API")
-    print("====================================================")
-
-    api_headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://blueprint.cyberlogitec.com.vn",
-        "Referer": UI_PAGE
-    }
-
-    api_resp = session.post(CHECKIN_API, headers=api_headers, timeout=30)
-
-    print("Checkin status:", api_resp.status_code)
-    print("Checkin response:", api_resp.text)
+    except Exception as e:
+        return {
+            "success": False,
+            "code": 9999,
+            "message": str(e),
+            "email": email,
+            "username": username
+        }
 
 
+# ================= MAIN =================
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run Blueprint checkin for one or many accounts."
-    )
+    parser = argparse.ArgumentParser(description="Blueprint auto checkin (n8n ready)")
     parser.add_argument(
-        "--accounts",
-        nargs="+",
-        help='List accounts in format "username:password". Example: --accounts "u1:p1" "u2:p2"',
+        "--account",
+        required=True,
+        help="Format: username:password:email"
     )
-    parser.add_argument(
-        "--accounts-json",
-        help='Path to JSON file containing accounts list. Example: [{"username":"u1","password":"p1"}]',
-    )
+
     args = parser.parse_args()
 
-    accounts = parse_accounts(args)
+    try:
+        username, password, email = parse_account(args.account)
+    except Exception as e:
+        output = {
+            "success": False,
+            "code": 2,
+            "message": f"Input error: {str(e)}",
+            "email": None,
+            "username": None
+        }
+        print(json.dumps(output))
+        sys.exit(2)
 
-    success_count = 0
-    failed_accounts = []
+    result = run_checkin(username, password, email)
 
-    for username, password in accounts:
-        try:
-            run_checkin(username, password)
-            success_count += 1
-        except Exception as ex:
-            print(f"\n[FAILED] {username}: {ex}")
-            failed_accounts.append(username)
+    # 🔥 OUTPUT JSON cho n8n
+    print(json.dumps(result, ensure_ascii=False))
 
-    print("\n================= RESULT =================")
-    print(f"Total accounts: {len(accounts)}")
-    print(f"Success: {success_count}")
-    print(f"Failed: {len(failed_accounts)}")
-    if failed_accounts:
-        print("Failed accounts:", ", ".join(failed_accounts))
+    if result["success"]:
+        sys.exit(0)
+    else:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
