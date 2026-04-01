@@ -6,13 +6,11 @@ import json
 import time
 from datetime import datetime
 from urllib.parse import urlparse
-from zoneinfo import ZoneInfo   # ✅ built-in Python 3.9+
-
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 START_URL = "https://blueprint.cyberlogitec.com.vn/sso/login"
 UI_PAGE = "https://blueprint.cyberlogitec.com.vn/UI_TAT_028"
 CHECKIN_API = "https://blueprint.cyberlogitec.com.vn/api/checkInOut/insert"
-
 
 # ================= ERROR CLASS =================
 class CheckinError(Exception):
@@ -20,7 +18,6 @@ class CheckinError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
-
 
 # ================= UTIL =================
 def to_absolute_url(base_url: str, location: str):
@@ -33,13 +30,11 @@ def to_absolute_url(base_url: str, location: str):
         return f"{parsed.scheme}://{parsed.netloc}{location}"
     return location
 
-
 def extract_login_action(html: str):
     match = re.search(r'action="([^"]+login-actions/authenticate[^"]+)"', html)
     if not match:
         raise CheckinError(1007, "Cannot find login form action URL")
     return match.group(1).replace("&amp;", "&")
-
 
 def create_session():
     session = requests.Session()
@@ -51,78 +46,92 @@ def create_session():
     })
     return session
 
-
 # ================= PARSE ACCOUNT =================
 def parse_account(raw: str):
     parts = raw.split(":")
-
     if len(parts) != 3:
         raise ValueError("Format must be username:password:email")
-
     username, password, email = parts
-
     username = username.strip()
     email = email.strip()
-
     if not username:
         raise ValueError("Username is empty")
-
     if not email:
         raise ValueError("Email is empty")
-
     return username, password, email
 
-
-# ================= TIME (FIXED) =================
+# ================= TIME =================
 def get_timestamp():
     vn_time = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
-    return vn_time.strftime("%d/%m/%Y %H:%M:%S")  # ✅ 24h format
+    return vn_time.strftime("%d/%m/%Y %H:%M:%S")  # 24h format
 
+# ================= CHECK SKIP =================
+def check_skip_day():
+    vn_holidays = set()  # Bạn có thể import holidays.Vietnam() nếu muốn check ngày lễ
+    today = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+    weekday = today.weekday()  # 0=Monday ... 6=Sunday
+    if today.date() in vn_holidays:
+        return "Ngày lễ"
+    elif weekday >= 5:
+        return "Thứ 7/Chủ nhật"
+    return None
 
 # ================= CORE LOGIC =================
 def run_checkin(username: str, password: str, email: str):
     session = create_session()
-
     start_time = time.time()
     timestamp = get_timestamp()
 
+    # Check skip
+    skip_reason = check_skip_day()
+    if skip_reason:
+        duration = time.time() - start_time
+        return {
+            "success": False,
+            "code": 0,
+            "message": "Check-in skip",
+            "skip_reason": skip_reason,
+            "email": email,
+            "username": username,
+            "timestamp": timestamp,
+            "duration_ms": int(duration*1000),
+            "duration_sec": round(duration,2)
+        }
+
     try:
+        # ================= STEP 1 =================
         r1 = session.get(START_URL, allow_redirects=False, timeout=30)
+        if not r1.ok:
+            raise CheckinError(r1.status_code, f"HTTP error at /sso/login: {r1.status_code}")
 
         redirect1 = r1.headers.get("Location")
         state_cookie = session.cookies.get("OAuth_Token_Request_State")
-
         if not state_cookie:
             raise CheckinError(1001, "Missing OAuth cookie")
-
         if not redirect1:
             raise CheckinError(1002, "No redirect to Keycloak")
 
         auth_url = to_absolute_url(START_URL, redirect1)
         r2 = session.get(auth_url, allow_redirects=True, timeout=30)
+        if not r2.ok:
+            raise CheckinError(r2.status_code, f"HTTP error at Keycloak login page: {r2.status_code}")
 
         login_action_url = extract_login_action(r2.text)
 
-        payload = {
-            "username": username,
-            "password": password,
-            "rememberMe": "on",
-            "credentialId": ""
-        }
-
+        payload = {"username": username, "password": password, "rememberMe": "on", "credentialId": ""}
         r3 = session.post(login_action_url, data=payload, allow_redirects=False, timeout=30)
 
-        redirect2 = r3.headers.get("Location")
+        if r3.status_code not in (200, 302, 303):
+            raise CheckinError(r3.status_code, f"Login failed: {r3.status_code}")
 
-        if r3.status_code not in (302, 303):
-            raise CheckinError(1003, "Login failed")
+        redirect2 = r3.headers.get("Location")
+        if not redirect2 or "code=" not in redirect2:
+            raise CheckinError(1004, "Missing authorization code in redirect URL")
 
         final_url = to_absolute_url(login_action_url, redirect2)
-
-        if "code=" not in final_url:
-            raise CheckinError(1004, "Missing authorization code")
-
-        session.get(final_url, allow_redirects=True, timeout=30)
+        r4 = session.get(final_url, allow_redirects=True, timeout=30)
+        if not r4.ok:
+            raise CheckinError(r4.status_code, f"HTTP error at blueprint callback: {r4.status_code}")
 
         jsession = session.cookies.get("JSESSIONID")
         if not jsession:
@@ -130,19 +139,13 @@ def run_checkin(username: str, password: str, email: str):
 
         session.get(UI_PAGE, allow_redirects=True, timeout=30)
 
-        api_headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Origin": "https://blueprint.cyberlogitec.com.vn",
-            "Referer": UI_PAGE
-        }
-
+        api_headers = {"Accept":"application/json, text/plain, */*", "Origin": "https://blueprint.cyberlogitec.com.vn", "Referer": UI_PAGE}
         api_resp = session.post(CHECKIN_API, headers=api_headers, timeout=30)
 
         if api_resp.status_code != 200:
-            raise CheckinError(1006, api_resp.text)
+            raise CheckinError(api_resp.status_code, f"Check-in API error: {api_resp.status_code}")
 
         duration = time.time() - start_time
-
         return {
             "success": True,
             "code": 0,
@@ -150,13 +153,12 @@ def run_checkin(username: str, password: str, email: str):
             "email": email,
             "username": username,
             "timestamp": timestamp,
-            "duration_ms": int(duration * 1000),
-            "duration_sec": round(duration, 2)
+            "duration_ms": int(duration*1000),
+            "duration_sec": round(duration,2)
         }
 
     except CheckinError as e:
         duration = time.time() - start_time
-
         return {
             "success": False,
             "code": e.code,
@@ -164,13 +166,23 @@ def run_checkin(username: str, password: str, email: str):
             "email": email,
             "username": username,
             "timestamp": timestamp,
-            "duration_ms": int(duration * 1000),
-            "duration_sec": round(duration, 2)
+            "duration_ms": int(duration*1000),
+            "duration_sec": round(duration,2)
         }
-
+    except requests.RequestException as e:
+        duration = time.time() - start_time
+        return {
+            "success": False,
+            "code": getattr(e.response, "status_code", 503),
+            "message": str(e),
+            "email": email,
+            "username": username,
+            "timestamp": timestamp,
+            "duration_ms": int(duration*1000),
+            "duration_sec": round(duration,2)
+        }
     except Exception as e:
         duration = time.time() - start_time
-
         return {
             "success": False,
             "code": 9999,
@@ -178,16 +190,14 @@ def run_checkin(username: str, password: str, email: str):
             "email": email,
             "username": username,
             "timestamp": timestamp,
-            "duration_ms": int(duration * 1000),
-            "duration_sec": round(duration, 2)
+            "duration_ms": int(duration*1000),
+            "duration_sec": round(duration,2)
         }
-
 
 # ================= MAIN =================
 def main():
-    parser = argparse.ArgumentParser(description="Blueprint auto checkin (n8n ready)")
+    parser = argparse.ArgumentParser(description="Blueprint auto checkin (always return JSON)")
     parser.add_argument("--account", required=True, help="username:password:email")
-
     args = parser.parse_args()
 
     try:
@@ -203,15 +213,12 @@ def main():
             "duration_ms": 0,
             "duration_sec": 0
         }
-        print(json.dumps(output))
+        print(json.dumps(output, ensure_ascii=False))
         sys.exit(2)
 
     result = run_checkin(username, password, email)
-
     print(json.dumps(result, ensure_ascii=False))
-
     sys.exit(0 if result["success"] else 1)
-
 
 if __name__ == "__main__":
     main()
