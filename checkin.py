@@ -3,6 +3,8 @@ import argparse
 import requests
 import sys
 import json
+import time
+from datetime import datetime
 from urllib.parse import urlparse
 
 
@@ -70,11 +72,21 @@ def parse_account(raw: str):
     return username, password, email
 
 
+# ================= TIME FORMAT =================
+def get_timestamp():
+    # dùng giờ local server (nên set server = Asia/Ho_Chi_Minh)
+    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
 # ================= CORE LOGIC =================
 def run_checkin(username: str, password: str, email: str):
     session = create_session()
 
+    start_time = time.time()
+    timestamp = get_timestamp()
+
     try:
+        # STEP 1
         r1 = session.get(START_URL, allow_redirects=False, timeout=30)
 
         redirect1 = r1.headers.get("Location")
@@ -86,11 +98,14 @@ def run_checkin(username: str, password: str, email: str):
         if not redirect1:
             raise CheckinError(1002, "No redirect to Keycloak")
 
+        # STEP 2
         auth_url = to_absolute_url(START_URL, redirect1)
         r2 = session.get(auth_url, allow_redirects=True, timeout=30)
 
+        # STEP 3
         login_action_url = extract_login_action(r2.text)
 
+        # STEP 4
         payload = {
             "username": username,
             "password": password,
@@ -105,19 +120,23 @@ def run_checkin(username: str, password: str, email: str):
         if r3.status_code not in (302, 303):
             raise CheckinError(1003, "Login failed")
 
+        # STEP 5
         final_url = to_absolute_url(login_action_url, redirect2)
 
         if "code=" not in final_url:
             raise CheckinError(1004, "Missing authorization code")
 
+        # STEP 6
         session.get(final_url, allow_redirects=True, timeout=30)
 
         jsession = session.cookies.get("JSESSIONID")
         if not jsession:
             raise CheckinError(1005, "JSESSIONID not found")
 
+        # STEP 7
         session.get(UI_PAGE, allow_redirects=True, timeout=30)
 
+        # STEP 8
         api_headers = {
             "Accept": "application/json, text/plain, */*",
             "Origin": "https://blueprint.cyberlogitec.com.vn",
@@ -129,30 +148,45 @@ def run_checkin(username: str, password: str, email: str):
         if api_resp.status_code != 200:
             raise CheckinError(1006, api_resp.text)
 
+        duration = time.time() - start_time
+
         return {
             "success": True,
             "code": 0,
             "message": "Success",
             "email": email,
-            "username": username
+            "username": username,
+            "timestamp": timestamp,
+            "duration_ms": int(duration * 1000),
+            "duration_sec": round(duration, 2)
         }
 
     except CheckinError as e:
+        duration = time.time() - start_time
+
         return {
             "success": False,
             "code": e.code,
             "message": e.message,
             "email": email,
-            "username": username
+            "username": username,
+            "timestamp": timestamp,
+            "duration_ms": int(duration * 1000),
+            "duration_sec": round(duration, 2)
         }
 
     except Exception as e:
+        duration = time.time() - start_time
+
         return {
             "success": False,
             "code": 9999,
             "message": str(e),
             "email": email,
-            "username": username
+            "username": username,
+            "timestamp": timestamp,
+            "duration_ms": int(duration * 1000),
+            "duration_sec": round(duration, 2)
         }
 
 
@@ -175,14 +209,17 @@ def main():
             "code": 2,
             "message": f"Input error: {str(e)}",
             "email": None,
-            "username": None
+            "username": None,
+            "timestamp": get_timestamp(),
+            "duration_ms": 0,
+            "duration_sec": 0
         }
         print(json.dumps(output))
         sys.exit(2)
 
     result = run_checkin(username, password, email)
 
-    # 🔥 OUTPUT JSON cho n8n
+    # OUTPUT JSON cho n8n
     print(json.dumps(result, ensure_ascii=False))
 
     if result["success"]:
