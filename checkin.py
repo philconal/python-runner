@@ -6,6 +6,7 @@ import json
 import time
 from datetime import datetime
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo   # ✅ built-in Python 3.9+
 
 
 START_URL = "https://blueprint.cyberlogitec.com.vn/sso/login"
@@ -72,10 +73,10 @@ def parse_account(raw: str):
     return username, password, email
 
 
-# ================= TIME FORMAT =================
+# ================= TIME (FIXED) =================
 def get_timestamp():
-    # dùng giờ local server (nên set server = Asia/Ho_Chi_Minh)
-    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    vn_time = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+    return vn_time.strftime("%d/%m/%Y %H:%M:%S")  # ✅ 24h format
 
 
 # ================= CORE LOGIC =================
@@ -86,7 +87,6 @@ def run_checkin(username: str, password: str, email: str):
     timestamp = get_timestamp()
 
     try:
-        # STEP 1
         r1 = session.get(START_URL, allow_redirects=False, timeout=30)
 
         redirect1 = r1.headers.get("Location")
@@ -98,14 +98,11 @@ def run_checkin(username: str, password: str, email: str):
         if not redirect1:
             raise CheckinError(1002, "No redirect to Keycloak")
 
-        # STEP 2
         auth_url = to_absolute_url(START_URL, redirect1)
         r2 = session.get(auth_url, allow_redirects=True, timeout=30)
 
-        # STEP 3
         login_action_url = extract_login_action(r2.text)
 
-        # STEP 4
         payload = {
             "username": username,
             "password": password,
@@ -120,23 +117,19 @@ def run_checkin(username: str, password: str, email: str):
         if r3.status_code not in (302, 303):
             raise CheckinError(1003, "Login failed")
 
-        # STEP 5
         final_url = to_absolute_url(login_action_url, redirect2)
 
         if "code=" not in final_url:
             raise CheckinError(1004, "Missing authorization code")
 
-        # STEP 6
         session.get(final_url, allow_redirects=True, timeout=30)
 
         jsession = session.cookies.get("JSESSIONID")
         if not jsession:
             raise CheckinError(1005, "JSESSIONID not found")
 
-        # STEP 7
         session.get(UI_PAGE, allow_redirects=True, timeout=30)
 
-        # STEP 8
         api_headers = {
             "Accept": "application/json, text/plain, */*",
             "Origin": "https://blueprint.cyberlogitec.com.vn",
@@ -193,11 +186,7 @@ def run_checkin(username: str, password: str, email: str):
 # ================= MAIN =================
 def main():
     parser = argparse.ArgumentParser(description="Blueprint auto checkin (n8n ready)")
-    parser.add_argument(
-        "--account",
-        required=True,
-        help="Format: username:password:email"
-    )
+    parser.add_argument("--account", required=True, help="username:password:email")
 
     args = parser.parse_args()
 
@@ -219,13 +208,9 @@ def main():
 
     result = run_checkin(username, password, email)
 
-    # OUTPUT JSON cho n8n
     print(json.dumps(result, ensure_ascii=False))
 
-    if result["success"]:
-        sys.exit(0)
-    else:
-        sys.exit(1)
+    sys.exit(0 if result["success"] else 1)
 
 
 if __name__ == "__main__":
